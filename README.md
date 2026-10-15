@@ -39,6 +39,9 @@ into the app's sidebar instead of setting the environment variable.
 
 - The default model is set by `DEFAULT_MODEL` in `app.py` and can be changed in the sidebar
   (for example `gemini-3.5-flash`, or an older Flash model if your key does not have access).
+- If Google returns a temporary "503 UNAVAILABLE / high demand" error, the app retries
+  automatically (waiting 2s, then 4s) and then falls back to the models in `FALLBACK_MODELS`.
+  If every model is busy you will see a "try again in a minute" message.
 - Never commit your API key to GitHub.
 
 ## Limitations
