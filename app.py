@@ -9,6 +9,7 @@ import io
 import json
 import os
 import re
+import time
 
 import streamlit as st
 from docx import Document
@@ -17,6 +18,10 @@ from google.genai import types
 from pypdf import PdfReader
 
 DEFAULT_MODEL = "gemini-3.5-flash"
+# Tried in order if the chosen model is overloaded (503) or unavailable.
+FALLBACK_MODELS = ["gemini-2.5-flash", "gemini-2.5-flash-lite"]
+RETRIES_PER_MODEL = 3
+RETRY_BASE_DELAY = 2  # seconds; doubles after each failed attempt
 MAX_RESUME_CHARS = 20000
 MAX_JD_CHARS = 8000
 MIN_RESUME_CHARS = 150
@@ -155,7 +160,25 @@ def normalize_result(data: dict) -> dict:
     }
 
 
+def _error_code(exc: Exception):
+    code = getattr(exc, "code", None)
+    return code if isinstance(code, int) else None
+
+
+def is_retryable(exc: Exception) -> bool:
+    """Temporary Google-side problems: overload, rate limit, server errors."""
+    if _error_code(exc) in (429, 500, 502, 503, 504):
+        return True
+    text = str(exc).lower()
+    return any(s in text for s in ("unavailable", "overloaded", "high demand", "resource_exhausted", "timed out"))
+
+
+def is_model_missing(exc: Exception) -> bool:
+    return _error_code(exc) == 404 or "not found" in str(exc).lower()
+
+
 def analyze_resume(resume_text: str, job_description: str, api_key: str, model: str) -> dict:
+    """Run the analysis, retrying temporary errors and falling back to other Flash models."""
     client = genai.Client(api_key=api_key)
     user_prompt = f"RESUME:\n{resume_text[:MAX_RESUME_CHARS]}\n\n"
     if job_description.strip():
@@ -163,15 +186,36 @@ def analyze_resume(resume_text: str, job_description: str, api_key: str, model: 
     else:
         user_prompt += "JOB DESCRIPTION: (none provided - evaluate general ATS readiness)\n"
 
-    response = client.models.generate_content(
-        model=model,
-        contents=user_prompt,
-        config=types.GenerateContentConfig(
-            system_instruction=SYSTEM_PROMPT,
-            response_mime_type="application/json",
-        ),
+    config = types.GenerateContentConfig(
+        system_instruction=SYSTEM_PROMPT,
+        response_mime_type="application/json",
     )
-    return normalize_result(parse_json_response(response.text))
+
+    models = [model] + [m for m in FALLBACK_MODELS if m != model]
+    last_error = None
+    for current in models:
+        for attempt in range(RETRIES_PER_MODEL):
+            try:
+                response = client.models.generate_content(
+                    model=current, contents=user_prompt, config=config
+                )
+                result = normalize_result(parse_json_response(response.text))
+                result["model_used"] = current
+                return result
+            except Exception as exc:
+                last_error = exc
+                if is_retryable(exc):
+                    if attempt < RETRIES_PER_MODEL - 1:
+                        time.sleep(RETRY_BASE_DELAY * (2 ** attempt))
+                    continue  # retry, then fall through to the next model
+                if is_model_missing(exc) and current != model:
+                    break  # fallback model not available on this key; try the next one
+                raise  # bad API key, bad request, unreadable output, etc.
+
+    raise RuntimeError(
+        "Google's Gemini models are overloaded right now. This is temporary - "
+        f"please try again in a minute. (Last error: {last_error})"
+    )
 
 
 # ----------------------------------------------------------------------------
@@ -200,6 +244,8 @@ def score_label(score: int) -> str:
 
 def render_results(result: dict) -> None:
     score = result["overall_score"]
+    if result.get("model_used"):
+        st.caption(f"Analyzed with {result['model_used']}")
     left, right = st.columns([1, 2])
     with left:
         st.metric("ATS Score", f"{score}/100", score_label(score), delta_color="off")
