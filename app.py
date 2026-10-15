@@ -19,7 +19,7 @@ from pypdf import PdfReader
 
 DEFAULT_MODEL = "gemini-3.5-flash"
 # Tried in order if the chosen model is overloaded (503) or unavailable.
-FALLBACK_MODELS = ["gemini-2.5-flash", "gemini-2.5-flash-lite"]
+FALLBACK_MODELS = ["gemini-3-flash-preview", "gemini-3.5-flash-lite"]
 RETRIES_PER_MODEL = 3
 RETRY_BASE_DELAY = 2  # seconds; doubles after each failed attempt
 MAX_RESUME_CHARS = 20000
@@ -192,7 +192,7 @@ def analyze_resume(resume_text: str, job_description: str, api_key: str, model: 
     )
 
     models = [model] + [m for m in FALLBACK_MODELS if m != model]
-    last_error = None
+    errors = {}  # model -> last error text, shown if every model fails
     for current in models:
         for attempt in range(RETRIES_PER_MODEL):
             try:
@@ -203,7 +203,7 @@ def analyze_resume(resume_text: str, job_description: str, api_key: str, model: 
                 result["model_used"] = current
                 return result
             except Exception as exc:
-                last_error = exc
+                errors[current] = str(exc)[:160]
                 if is_retryable(exc):
                     if attempt < RETRIES_PER_MODEL - 1:
                         time.sleep(RETRY_BASE_DELAY * (2 ** attempt))
@@ -212,9 +212,11 @@ def analyze_resume(resume_text: str, job_description: str, api_key: str, model: 
                     break  # fallback model not available on this key; try the next one
                 raise  # bad API key, bad request, unreadable output, etc.
 
+    details = "; ".join(f"{m}: {e}" for m, e in errors.items())
     raise RuntimeError(
-        "Google's Gemini models are overloaded right now. This is temporary - "
-        f"please try again in a minute. (Last error: {last_error})"
+        "No Gemini model could answer right now. If the errors below say 503/UNAVAILABLE, "
+        "Google is overloaded - try again in a minute. If they say 404/NOT_FOUND, a model "
+        f"name is outdated - change it in the sidebar. Details: {details}"
     )
 
 
